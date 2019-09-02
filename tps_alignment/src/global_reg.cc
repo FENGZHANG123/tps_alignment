@@ -32,6 +32,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <math.h>
 #include <time.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <sys/time.h>
 
 #include <string.h>
@@ -39,12 +40,28 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <utility>
 #include <iostream>
 #include <fstream>
+//Barrow
+
+#include <Eigen/Dense>		//Suck that jamma.
+
+#include <iostream>
+#include <fstream>
+#include <string>
+
+#include "generate_ply.h"
+#include "generate_pcd.h"
 
 using namespace std;
 
 #define BREAK_FACTOR 5u
 
 int pruned_points = 0, thinned_points = 0, conf_points = 0;
+
+//nelson ho
+int globalreg_num_points = 0;
+#define GLOBALHEADERLENGTH 10
+string globalregfilename = "global_reg";
+
 
 #undef COMPUTE_RMS_ERR
 
@@ -54,6 +71,8 @@ int pruned_points = 0, thinned_points = 0, conf_points = 0;
 #define MAX_SPRING_LEN 50.0f
 // #define MIN_TARGET_DIST2 64.0f
 // #define MIN_TARGET_DIST2 8.0f // for sea floor
+// Barrow
+#define THIN_POINTS_OUT
 
 #ifndef SQ
 #define SQ(x) ((x) * (x))
@@ -470,7 +489,31 @@ void align_scan(const opts_t &opts, const char *mesh_name, const corr_vector &co
     matrix_t lambda = opts.lambda * tps_size;
     farr A, w;
     
-    update_transform_mat(x, y, lambda, w, A);
+#ifdef CUDALU_
+	//this is broken so log the crap out for the minute
+
+	std::cout << "DEBUG dump input to x.csv " <<std::endl;
+	  MatrixXf xE(x.dim2(),x.dim1());
+	  Jamma2Eigen(x,xE);						//1 copy w and A into Eigen matrices
+	  twoDarray xD = twoDarray(x.dim1(),x.dim2(),xE.data());	//2 cast these as my stupid type and dump to csv if needed
+	  xD.csvDump("x.csv");
+
+		std::cout << "DEBUG dump input to y.csv " <<std::endl;
+		  MatrixXf yE(y.dim2(),y.dim1());
+		  Jamma2Eigen(y,yE);						//1 copy w and A into Eigen matrices
+		  twoDarray yD = twoDarray(y.dim1(),y.dim2(),yE.data());	//2 cast these as my stupid type and dump to csv if needed
+		  yD.csvDump("y.csv");
+	 //End debug crap
+#endif
+    //Barrow for baseline correspondance
+    if(opts.baseline_prefix && opts.nonrigid_prefix)
+    {
+
+    	sprintf(out_name, "%s",get_mesh_name(mesh_name));
+    	update_transform_mat(x, y, lambda, w, A,out_name);//y are the control point target locs x are control point source locations
+    }
+    else	//End Barrow
+    	update_transform_mat(x, y, lambda, w, A);
 
     if (opts.affine_prefix) {
       xform xfout = xform(A[0][0], A[0][1], A[0][2], A[0][3],
@@ -494,7 +537,15 @@ void align_scan(const opts_t &opts, const char *mesh_name, const corr_vector &co
     }
 
     if (opts.nonrigid_prefix) {
-      farr tmp_x = warp_points(verts, x, w, A);
+    	farr tmp_x;
+		//Barrow for baseline correspondance
+		if(opts.baseline_prefix && opts.nonrigid_prefix)
+		{
+			sprintf(out_name, "%s",get_mesh_name(mesh_name));
+			tmp_x = warp_points(verts, x, w, A,out_name);
+		}
+		else	//End Barrow
+			tmp_x = warp_points(verts, x, w, A);
 
       for (unsigned int j = 0; j < mesh->vertices.size(); j++) {
         mesh->vertices[j][0] = tmp_x[j][0];
@@ -504,6 +555,67 @@ void align_scan(const opts_t &opts, const char *mesh_name, const corr_vector &co
 
       sprintf(out_name, "%s%s", opts.nonrigid_prefix, get_mesh_name(mesh_name));
       mesh->write(out_name);
+    }
+
+
+    //Barrow, for baseline correspondance
+    if(opts.baseline_prefix && opts.nonrigid_prefix)
+    {
+    	//Get a copy of the original mesh
+    	FILE *corrs;
+    	farr Tverts;
+
+
+    	//for better or worse, using the farr version
+    	Tverts = farr(mesh->vertices.size(), 3);
+        for (unsigned int j = 0; j < mesh->vertices.size(); j++) {
+          point p = xfin * mesh->vertices[j];
+          for (int k = 0; k < 3; k++) Tverts[j][k] =  p[k];
+        }
+
+    	//assert((Omesh->vertices.size() == mesh->vertices.size()) && "Correspondance writing: source and target meshes are not the same size\n");
+
+    	sprintf(out_name, "%s%s.txt",opts.baseline_prefix, get_mesh_name(mesh_name));
+    	fprintf(stderr,"will write out global correspondances to %s \n",out_name);
+
+    	//Open correspondences file
+    	corrs = fopen(out_name,"w");
+    	fprintf(corrs, "Sx Sy Sz Tx Ty Tz i [ %zu ] points\n",mesh->vertices.size());
+
+    	for (unsigned int j = 0; j < mesh->vertices.size(); j++)
+    	{
+    		fprintf(corrs,"%f %f %f %f %f %f\n",
+    				verts[j][0],
+					verts[j][1],
+					verts[j][2],
+					Tverts[j][0],//mesh->vertices[j][0],
+					Tverts[j][1],//mesh->vertices[j][1],
+					Tverts[j][2]//mesh->vertices[j][2]
+									  	  	  	  );
+    	}
+    	fclose(corrs);
+
+    	//write ply and should also write a .pcd
+    	//TODO make those output functions more robust?
+    	sprintf(out_name, "%s%s.ply",opts.baseline_prefix, get_mesh_name(mesh_name));
+    	fprintf(stderr,"will write out correspondances ply to %s \n",out_name);
+    	SnT_2_ply(out_name,verts,Tverts);
+      //nelson ho
+      fprintf(stderr,"will append correspondences ply to global_reg ply \n");
+      globalreg_num_points += (verts.dim1() + Tverts.dim1() );
+      //this function appends the points to the global reg
+      string outputplystring = globalregfilename + ".ply.tmp";
+      char *outputplyfile = new char[outputplystring.length()+1];
+      strcpy(outputplyfile, outputplystring.c_str());
+      SnT_append_ply(outputplyfile, verts, Tverts);
+      delete outputplyfile;
+      //end nelson ho
+    	sprintf(out_name, "%s%s.pcd",opts.baseline_prefix, get_mesh_name(mesh_name));
+    	fprintf(stderr,"will write out correspondances pcd to %s \n",out_name);
+    	SnT_2_pcd(out_name,verts,Tverts);
+    	
+    	//TODO map Tvert indices to the canonical?
+
     }
   }
 
@@ -537,6 +649,7 @@ private:
 
   // read the new-style correspondence input from corr*.txt
   void read_corr_points(void) {
+	std::string line;
     vector<char *> corr_files;
 
     // header: number of points and sources
@@ -545,14 +658,18 @@ private:
     // get list of mesh names
     for (int i = 0; i < num_meshes; i++) {
       char fname[1024];
-      scanf(" %s ", fname);
+      //scanf(" %s ", fname);
+      std::getline(std::cin, line);
+      sprintf(fname, "%.1024s", line.c_str());
       mesh_names.push_back(strdup(fname));
     }
 
     // get list of corr files
     for (int i = 0; i < num_meshes; i++) {
       char fname[1024];
-      scanf(" %s ", fname);
+      //scanf(" %s ", fname);
+      std::getline(std::cin, line);
+      sprintf(fname, "%.1024s", line.c_str());
       corr_files.push_back(strdup(fname));
     }
 
@@ -576,7 +693,8 @@ private:
       // so we need to scan the list of targets to figure out
       int offset_num = 0;
       while (offset_num < num_meshes && strcmp(mesh_name, mesh_names[offset_num])) offset_num++;
-      assert(offset_num < num_meshes); // true if source is also a target
+	  printf("\nmesh num %i offset: %i\nmeshname: %s \n fff meshnames[2]: %s\n \n",num_meshes,offset_num,mesh_name,mesh_names[2]);
+	  assert(offset_num < num_meshes); // true if source is also a target
       offsets[offset_num + 1] = num_scan_points;
 
       // read in the list of correspondeces for this source
@@ -830,7 +948,8 @@ private:
 
 // see opts_t for options
 int main(int argc, char *argv[]) {
-  vector<char *> global_names;
+
+	vector<char *> global_names;
 
   opts_t opts(argc, argv);
 
@@ -894,7 +1013,8 @@ int main(int argc, char *argv[]) {
   }
   int f = 0;
 
-#if 1
+ //Barrow, removed this for an experiment.
+#ifdef THIN_POINTS_OUT
   thin_points(opts.min_target_dist2, rc.targets, rc.use_points, rc.errors, rc.springs);
 
   f = 0;
@@ -1020,14 +1140,61 @@ int main(int argc, char *argv[]) {
 
   // return 0; // uncomment this for debugging to see just the point optimizations, and not waste time warping
 
-  // do alignment
+  //nelson ho
+  //create global registration file if it doesn't exist
+  //write tverts to this file each iteration
+  string globalregfiletmp = globalregfilename + ".ply.tmp";
+  FILE *globalregout;
+  //create the file
+  globalregout = fopen(globalregfiletmp.c_str(), "w");
+  //write header
+  fprintf(globalregout,"ply\n");
+  fprintf(globalregout,"format ascii 1.0\n");
+  fprintf(globalregout,"element vertex\n");
+  fprintf(globalregout,"property float x\n");
+  fprintf(globalregout,"property float y\n");
+  fprintf(globalregout,"property float z\n");
+  fprintf(globalregout,"property uchar red\n");
+  fprintf(globalregout,"property uchar green\n");
+  fprintf(globalregout,"property uchar blue\n");
+  fprintf(globalregout,"end_header\n");
+	fclose(globalregout);
+
+	//create file to correlate each scan to start index/line/point in the global registration file
+	FILE *globalregmap;
+	string globalregmapname = globalregfilename + "_mapping.txt";
+	globalregmap = fopen(globalregmapname.c_str(),"w");
+	
+  //todo: wtf to do about nthreads? do alignment
   if (opts.nthreads == 1) {
-    for (int i = 0; i < rc.num_meshes; i++)
+    for (int i = 0; i < rc.num_meshes; i++){
+			fprintf(globalregmap,"%s %d\n",rc.mesh_names[i], GLOBALHEADERLENGTH + 1 + globalreg_num_points);//nelson ho
       align_scan(opts, rc.mesh_names[i], rc.corrs[i], rc.targets, rc.use_points, rc.confidence, rc.points_mesh, all_faces, NULL);
+		}
   } else {
     // multithreaded version
+	assert("only works with single thread option!");
     threaded_alignment ta(opts, rc.mesh_names, rc.corrs, rc.targets, rc.use_points, rc.confidence, rc.points_mesh, all_faces);
   }
+	fclose(globalregmap);
+  
+  //fix header for global_res.ply to add the total number of vertices
+  ifstream ifile(globalregfiletmp.c_str());
+  //globalregfilename is defined as a global var
+  string finalplyfile = globalregfilename + ".ply";
+  ofstream ofile(finalplyfile.c_str());
+  string line;
+  while(!ifile.eof()){
+    getline(ifile,line);
+    if(line == "element vertex"){
+      ofile << "element vertex " << globalreg_num_points << endl;
+    } else {
+      ofile << line << endl;
+    }
+  }
+  ifile.close();
+  ofile.close();
+  remove(globalregfiletmp.c_str());
 
   delete rc.points_mesh;
 
@@ -1057,4 +1224,6 @@ int main(int argc, char *argv[]) {
     delete tgt;
   }
 #endif
+
+
 }
